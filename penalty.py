@@ -4,68 +4,93 @@ import torch.optim as optim
 from tqdm import tqdm
 import os
 from prox_problem import energy, constraint
-from utils import save_graph_visualization, log_training, save_graph_visualization_b
+from utils import save_graph_visualization, log_training
 
-def penalty_method_dynamic_lr(
+
+def penalty_method(
     rho_init, b_init, weight_init, beta, sigma, log_file, save_dir,
     max_iter=1000, lr=1e-3, log_every_iters=100, save_every_iters=500, scheduler_step=100
 ):
+    """
+    Optimizes the penalty method to solve energy minimization problem with constraints.
+
+    Parameters:
+        rho_init (Tensor): Initial density tensor.
+        b_init (Tensor): Initial b tensor (boundary conditions).
+        weight_init (Tensor): Weight tensor used in the energy calculation.
+        beta (float): A regularization parameter for the constraint.
+        sigma (float): Penalty factor for the constraint.
+        log_file (str): Path to the log file for training progress.
+        save_dir (str): Directory to save the graph visualizations.
+        max_iter (int): Maximum number of iterations for optimization.
+        lr (float): Learning rate for the optimizer.
+        log_every_iters (int): Frequency of logging training progress.
+        save_every_iters (int): Frequency of saving visualizations.
+        scheduler_step (int): Frequency of scheduler step updates.
+
+    Returns:
+        rho (Tensor): Optimized density tensor.
+        b (Tensor): Optimized b tensor.
+        weight (Tensor): Final weight tensor.
+        loss_history (list): History of loss values during training.
+        lr_history (list): History of learning rates during training.
+    """
+
     # Initialize variables
     log_rho = torch.log(rho_init.clamp(min=1e-8))[:, 1:-1]  # Avoid log(0) or log(negative)
-    log_rho = log_rho.clone().detach().requires_grad_(True)
-    b_optim = b_init[:, 1:-1].clone().detach().requires_grad_(True)
-    # log_weight = torch.log(weight_init.clamp(min=1e-8))[:, 1:-1]
-    # log_weight = log_weight.clone().detach().requires_grad_(True)
-    weight = weight_init
+    log_rho = log_rho.clone().detach().requires_grad_(True)  # Set log_rho as a trainable variable
+    b_optimized = b_init[:, 1:-1].clone().detach().requires_grad_(True)  # Optimized b variable
+    weight = weight_init  # Weight tensor remains unchanged in optimization
 
-    # Create optimizer
-    optimizer = torch.optim.Adam([log_rho, b_optim], lr=lr)
-    
-    # Create scheduler (Reduce learning rate when loss plateaus)
+    # Create optimizer (Adam for log_rho and b_optimized)
+    optimizer = torch.optim.Adam([log_rho, b_optimized], lr=lr)
+
+    # Learning rate scheduler (reduce learning rate when loss plateaus)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50, verbose=True)
 
-    loss_history = []
-    lr_history = []
+    loss_history = []  # Store loss values
+    lr_history = []  # Store learning rate values
 
+    # Main optimization loop
     for iteration in tqdm(range(max_iter + 1), desc="Optimizing"):
-        optimizer.zero_grad()
+        optimizer.zero_grad()  # Reset gradients for each iteration
 
-        # Compute density tensor from log_rho
+        # Reconstruct rho and b tensors using the optimized values
         rho = torch.exp(log_rho)
-        rho = torch.cat([rho_init[:, 0:1], rho, rho_init[:, -1:]], dim=1)
-        # weight = torch.exp(log_weight)
-        # weight = torch.cat([weight_init[:, 0:1], weight, weight_init[:, -1:]], dim=1)
-        b = torch.cat([b_init[:, 0:1], b_optim, b_init[:, -1:]], dim=1)
+        rho = torch.cat([rho_init[:, 0:1], rho, rho_init[:, -1:]], dim=1)  # Reattach boundary conditions
+        b = torch.cat([b_init[:, 0:1], b_optimized, b_init[:, -1:]], dim=1)  # Same for b
 
-        # Compute losses
-        loss_energy = energy(rho, b, weight)
-        loss_constraint = torch.mean(torch.sum(constraint(rho, b, weight, beta)**2, dim=2), dim=1)
-        loss = torch.mean(loss_energy + loss_constraint * sigma)
-        losses = [torch.mean(loss_energy), torch.mean(loss_constraint)]
-        loss_history.append(loss.item())
+        # Compute losses: energy and constraint
+        loss_energy = torch.mean(energy(rho, b, weight))  # Energy loss
+        loss_constraint = torch.mean(constraint(rho, b, weight, beta))  # Constraint violation loss
+        losses = [loss_energy, loss_constraint]
+        
+        # Total loss, weighted by sigma for the constraint term
+        loss = loss_energy + loss_constraint * sigma
+        loss_history.append(loss.item())  # Record loss value
 
-        # Backpropagation
+        # Backpropagation (compute gradients)
         loss.backward()
 
-        # Optimizer step
+        # Optimizer step (update variables)
         optimizer.step()
 
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
 
-        # Record learning rate
-        lr_history.append(optimizer.param_groups[0]['lr'])
+        # Record the learning rate for analysis
+        lr_history.append(current_lr)
 
-        # Scheduler step
+        # Scheduler step: update the learning rate if needed
         if iteration % scheduler_step == 0:
             scheduler.step(loss)
 
-        # Logging
+        # Log the training progress
         if iteration % log_every_iters == 0:
             log_training(log_file, iteration, max_iter, losses, loss, current_lr)
 
-        # Save results
+        # Save visualizations periodically
         if iteration % save_every_iters == 0:
-            save_graph_visualization_b(save_dir, rho, b, iteration)
+            save_graph_visualization(save_dir, rho, b, iteration, is_directed=True)
 
     return rho, b, weight, loss_history, lr_history
